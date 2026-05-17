@@ -1,0 +1,10 @@
+[package]
+name = "aamina"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+cpal = "0.15"
+ringbuf = "0.3"
+anyhow = "1.0"
