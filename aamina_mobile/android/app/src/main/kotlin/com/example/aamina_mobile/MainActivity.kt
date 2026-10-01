@@ -41,6 +41,12 @@ class MainActivity : FlutterActivity() {
     @Volatile private var isCapturing = false
     @Volatile private var currentMode = "internal"
     @Volatile private var audioSocket: Socket? = null
+    @Volatile private var targetHost = "127.0.0.1"
+    private var targetPort = 5000
+
+    /// Holds the Flutter result for "internal" mode until the user
+    /// grants/denies the MediaProjection permission dialog.
+    private var pendingStartResult: MethodChannel.Result? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -61,8 +67,28 @@ class MainActivity : FlutterActivity() {
                 when (call.method) {
                     "startCapture" -> {
                         val mode = call.argument<String>("mode") ?: "internal"
-                        startMode(mode)
-                        result.success(true)
+                        val host = call.argument<String>("host") ?: "127.0.0.1"
+                        val port = (call.argument<Int>("port") ?: 5000)
+                        targetHost = host
+                        targetPort = port
+                        if (mode == "internal") {
+                            // Async: result is answered after the user grants
+                            // the MediaProjection dialog (see onActivityResult).
+                            pendingStartResult?.error("CANCELLED", "Superseded by a new start request", null)
+                            pendingStartResult = result
+                            startMode(mode)
+                        } else {
+                            try {
+                                startMode(mode)
+                                result.success(true)
+                            } catch (e: SecurityException) {
+                                Log.e("Aamina", "startCapture failed (permission)", e)
+                                result.error("PERMISSION", e.message, null)
+                            } catch (e: Exception) {
+                                Log.e("Aamina", "startCapture failed", e)
+                                result.error("START_FAILED", e.message, null)
+                            }
+                        }
                     }
                     "stopCapture" -> {
                         stopCapture()
@@ -106,9 +132,24 @@ class MainActivity : FlutterActivity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == requestCodeProjection && resultCode == Activity.RESULT_OK && data != null) {
-            mediaProjection = projectionManager!!.getMediaProjection(resultCode, data)
-            startInternalAudioCapture()
+        if (requestCode == requestCodeProjection) {
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                mediaProjection = projectionManager!!.getMediaProjection(resultCode, data)
+                try {
+                    startInternalAudioCapture()
+                    pendingStartResult?.success(true)
+                } catch (e: Exception) {
+                    Log.e("Aamina", "Internal capture start failed", e)
+                    pendingStartResult?.error("START_FAILED", e.message, null)
+                } finally {
+                    pendingStartResult = null
+                }
+            } else {
+                Log.w("Aamina", "MediaProjection permission denied by user")
+                stopCapture()
+                pendingStartResult?.error("DENIED", "Screen-capture permission was denied", null)
+                pendingStartResult = null
+            }
         }
     }
 
@@ -293,9 +334,9 @@ class MainActivity : FlutterActivity() {
             }
 
             try {
-                val socket = Socket("127.0.0.1", 5000)
+                val socket = Socket(targetHost, targetPort)
                 audioSocket = socket
-                Log.i("Aamina", "Connected to laptop 127.0.0.1:5000")
+                Log.i("Aamina", "Connected to $targetHost:$targetPort")
                 return socket.getOutputStream()
             } catch (_: IOException) {
                 try {
