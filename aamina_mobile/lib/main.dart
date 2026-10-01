@@ -43,6 +43,13 @@ class _AudioPageState extends State<AudioPage> {
   final TextEditingController hostController =
       TextEditingController(text: "127.0.0.1");
 
+  /// When true (internal mode only), the phone's media volume is set to 0
+  /// while streaming and restored when streaming stops.
+  bool mutePhone = false;
+
+  /// Phone media volume before we muted it, so it can be restored.
+  int? savedVolume;
+
   @override
   void dispose() {
     hostController.dispose();
@@ -84,6 +91,17 @@ class _AudioPageState extends State<AudioPage> {
           "host": hostController.text.trim(),
           "port": 5000,
         });
+        // Mute the phone speaker (internal mode): AudioPlaybackCapture
+        // keeps flowing; the stream is played on the laptop, so plug your
+        // earphones into the LAPTOP.
+        if (mode == "internal" && mutePhone) {
+          try {
+            savedVolume = await platform.invokeMethod<int>("getVolume");
+            await platform.invokeMethod("setVolume", {"volume": 0});
+          } catch (_) {
+            savedVolume = null;
+          }
+        }
         setState(() {
           running = true;
           waitingForPermission = false;
@@ -95,6 +113,12 @@ class _AudioPageState extends State<AudioPage> {
         });
       } else {
         await platform.invokeMethod("stopCapture");
+        if (savedVolume != null) {
+          try {
+            await platform.invokeMethod("setVolume", {"volume": savedVolume});
+          } catch (_) {}
+          savedVolume = null;
+        }
         setState(() {
           running = false;
           waitingForPermission = false;
@@ -103,6 +127,12 @@ class _AudioPageState extends State<AudioPage> {
       }
     } on PlatformException catch (e) {
       if (!mounted) return;
+      if (savedVolume != null) {
+        try {
+          await platform.invokeMethod("setVolume", {"volume": savedVolume});
+        } catch (_) {}
+        savedVolume = null;
+      }
       setState(() {
         running = false;
         waitingForPermission = false;
@@ -175,6 +205,24 @@ class _AudioPageState extends State<AudioPage> {
               ),
             ),
             const SizedBox(height: 12),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Checkbox(
+                  value: mutePhone,
+                  onChanged: running || waitingForPermission
+                      ? null
+                      : (v) => setState(() => mutePhone = v ?? false),
+                ),
+                const Flexible(
+                  child: Text(
+                    "Mute phone while streaming\n(listen on laptop 🎧)",
+                    style: TextStyle(color: Colors.white70, fontSize: 13),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
             Padding(
               padding: const EdgeInsets.symmetric(horizontal: 32),
               child: Text(
