@@ -351,6 +351,23 @@ mod tests {
     }
 
     #[test]
+    fn resampler_appends_to_a_reused_output_buffer() {
+        // The socket reader reuses one Vec across reads and relies on
+        // process() appending. Clearing must therefore not be required by
+        // process() itself, and each call must only add its own samples.
+        let mut resampler = Resampler::new(44_100, 48_000);
+        let mut out = Vec::new();
+
+        resampler.process(&[100, 200, 300], &mut out);
+        let first = out.len();
+        assert!(first > 0);
+        out.truncate(first);
+
+        resampler.process(&[400, 500, 600], &mut out);
+        assert_eq!(out.len(), first * 2, "second call added its own samples");
+    }
+
+    #[test]
     fn resampler_passes_through_matching_rates() {
         let input: Vec<i16> = (0..100).map(|i| (i * 300) as i16).collect();
         let mut resampler = Resampler::new(44_100, 44_100);
