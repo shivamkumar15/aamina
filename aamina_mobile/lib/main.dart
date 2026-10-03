@@ -47,9 +47,6 @@ class _AudioPageState extends State<AudioPage> {
   /// while streaming and restored when streaming stops.
   bool mutePhone = false;
 
-  /// Phone media volume before we muted it, so it can be restored.
-  int? savedVolume;
-
   @override
   void dispose() {
     hostController.dispose();
@@ -59,7 +56,11 @@ class _AudioPageState extends State<AudioPage> {
   /// Request RECORD_AUDIO permission at runtime.
   /// Without this, AudioRecord creation crashes with SecurityException
   /// on Android 6+ (API 23+).
+  ///
+  /// Only the capturing modes need it — "tone" just synthesises PCM, so it
+  /// must keep working when the user declines the microphone prompt.
   Future<bool> _ensurePermissions() async {
+    if (mode == "tone") return true;
     final status = await Permission.microphone.request();
     return status.isGranted;
   }
@@ -68,8 +69,8 @@ class _AudioPageState extends State<AudioPage> {
     try {
       if (!running) {
         final granted = await _ensurePermissions();
+        if (!mounted) return;
         if (!granted) {
-          if (!mounted) return;
           setState(() {
             status = "Microphone permission denied — streaming needs it.";
           });
@@ -86,27 +87,19 @@ class _AudioPageState extends State<AudioPage> {
               ? "Tap “Start now” on the Android screen-capture prompt…"
               : "Connecting to ${hostController.text.trim()}:5000…";
         });
-        // Mute the phone speaker (internal mode): the experimental
-        // silent player keeps the pipeline alive; your earphones must be
-        // plugged into the LAPTOP.
-        if (mode == "internal" && mutePhone) {
-          // Handled natively AFTER the screen-capture grant dialog —
-          // pass the flag through so timing is right.
-          await platform.invokeMethod("startCapture", {
-            "mode": mode,
-            "host": hostController.text.trim(),
-            "port": 5000,
-            "mutePhone": true,
-          });
-          savedVolume = -1; // native side owns save/restore now
-        } else {
-          await platform.invokeMethod("startCapture", {
-            "mode": mode,
-            "host": hostController.text.trim(),
-            "port": 5000,
-            "mutePhone": false,
-          });
-        }
+        // The mute flag is applied natively AFTER the screen-capture grant
+        // dialog (internal mode), so it is always passed through. Mute the
+        // phone speaker: the silent player keeps the pipeline alive; your
+        // earphones must be plugged into the LAPTOP.
+        await platform.invokeMethod("startCapture", {
+          "mode": mode,
+          "host": hostController.text.trim(),
+          "port": 5000,
+          "mutePhone": mode == "internal" && mutePhone,
+        });
+        // The native side answers only after the user granted (or denied)
+        // screen capture, so this widget can be gone by now.
+        if (!mounted) return;
         setState(() {
           running = true;
           waitingForPermission = false;
@@ -120,8 +113,7 @@ class _AudioPageState extends State<AudioPage> {
         });
       } else {
         await platform.invokeMethod("stopCapture");
-        // Native side restores the phone volume itself; just clear the flag.
-        savedVolume = null;
+        if (!mounted) return;
         setState(() {
           running = false;
           waitingForPermission = false;
@@ -130,8 +122,6 @@ class _AudioPageState extends State<AudioPage> {
       }
     } on PlatformException catch (e) {
       if (!mounted) return;
-      // Native side restores volume on stop/deny too.
-      savedVolume = null;
       setState(() {
         running = false;
         waitingForPermission = false;
@@ -142,6 +132,15 @@ class _AudioPageState extends State<AudioPage> {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(e.code == "DENIED" ? "Screen-capture denied." : "Unable to start streaming right now.")),
       );
+    } on MissingPluginException {
+      // The aamina/audio channel only exists in the Android app; without this
+      // the button would silently do nothing on desktop/web.
+      if (!mounted) return;
+      setState(() {
+        running = false;
+        waitingForPermission = false;
+        status = "Streaming is only implemented on Android.";
+      });
     }
   }
 
@@ -153,7 +152,7 @@ class _AudioPageState extends State<AudioPage> {
 
       appBar: AppBar(
         title: const Text("Aamina"),
-   analyse these pdf and give me possible questions coming for my collage exam   ),
+      ),
 
       body: Center(
         child: Column(
