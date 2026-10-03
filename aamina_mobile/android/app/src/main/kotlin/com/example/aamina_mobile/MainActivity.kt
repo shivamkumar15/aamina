@@ -9,6 +9,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
+import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -23,6 +24,7 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.IOException
 import java.net.Socket
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import kotlin.math.PI
 import kotlin.math.abs
@@ -45,9 +47,23 @@ class MainActivity : FlutterActivity() {
     @Volatile private var targetHost = "127.0.0.1"
     private var targetPort = 5000
 
+    /// Silent local player used during "Mute phone" mode: it replays the
+    /// captured stream locally at volume 0 so the internal-audio pipeline
+    /// stays active while nothing comes out of the phone speaker.
+    private var silentPlayer: AudioTrack? = null
+
     /// Holds the Flutter result for "internal" mode until the user
     /// grants/denies the MediaProjection permission dialog.
     private var pendingStartResult: MethodChannel.Result? = null
+
+    /// "Mute phone" flag for the in-flight internal-mode start request.
+    private var pendingMutePhone = false
+
+    /// Phone STREAM_MUSIC volume saved before muting, restored on stop.
+    private var savedVolume: Int? = null
+
+    /// Latest per-second average captured sample level (diagnostics).
+    private val lastCaptureAvg = AtomicReference(0.0)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -77,6 +93,8 @@ class MainActivity : FlutterActivity() {
                             // the MediaProjection dialog (see onActivityResult).
                             pendingStartResult?.error("CANCELLED", "Superseded by a new start request", null)
                             pendingStartResult = result
+                            // Applied AFTER the user grants the dialog.
+                            pendingMutePhone = call.argument<Boolean>("mutePhone") ?: false
                             startMode(mode)
                         } else {
                             try {
@@ -93,6 +111,25 @@ class MainActivity : FlutterActivity() {
                     }
                     "stopCapture" -> {
                         stopCapture()
+                        result.success(true)
+                    }
+                    "getVolume" -> {
+                        result.success(getStreamVolume())
+                    }
+                    "setVolume" -> {
+                        val volume = call.argument<Int>("volume") ?: 0
+                        setStreamVolume(volume)
+                        result.success(true)
+                    }
+                    "getVolume" -> {
+                        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                        result.success(audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+                    }
+                    "setVolume" -> {
+                        val volume = call.argument<Int>("volume") ?: 0
+                        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                        val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+                        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, volume.coerceIn(0, max), 0)
                         result.success(true)
                     }
                     else -> result.notImplemented()
@@ -138,15 +175,28 @@ class MainActivity : FlutterActivity() {
                 mediaProjection = projectionManager!!.getMediaProjection(resultCode, data)
                 try {
                     startInternalAudioCapture()
+                    // Mute the phone speaker but keep the stream flowing:
+                    // route captured audio to a silent local player too.
+                    if (pendingMutePhone) {
+                        savedVolume = getStreamVolume()
+                        // EXPERIMENTAL: does capture survive STREAM_MUSIC=0
+                        // on this device? Verified via the mute probe below.
+                        setStreamVolume(0)
+                        runMuteVolumeProbe()
+                        startSilentPlayer()
+                    }
+                    pendingMutePhone = false
                     pendingStartResult?.success(true)
                 } catch (e: Exception) {
                     Log.e("Aamina", "Internal capture start failed", e)
+                    pendingMutePhone = false
                     pendingStartResult?.error("START_FAILED", e.message, null)
                 } finally {
                     pendingStartResult = null
                 }
             } else {
                 Log.w("Aamina", "MediaProjection permission denied by user")
+                pendingMutePhone = false
                 stopCapture()
                 pendingStartResult?.error("DENIED", "Screen-capture permission was denied", null)
                 pendingStartResult = null
@@ -258,6 +308,7 @@ class MainActivity : FlutterActivity() {
                     if (now - last >= 1000) {
                         val kbps = (bytes * 8.0) / 1000.0
                         val avg = if (levelCount > 0) levelSum.toDouble() / levelCount.toDouble() else 0.0
+                        lastCaptureAvg.set(avg)
                         Log.i("Aamina", "mode=$currentMode kbps=${"%.1f".format(kbps)} avg=${"%.1f".format(avg)} peak=$peak")
                         bytes = 0
                         levelSum = 0
@@ -360,6 +411,7 @@ class MainActivity : FlutterActivity() {
         captureThread = null
         toneThread = null
 
+        stopSilentPlayer()
         closeSocketQuietly()
 
         try {
@@ -375,12 +427,110 @@ class MainActivity : FlutterActivity() {
 
     private fun stopCapture() {
         stopAudioPipelineOnly()
+        restoreVolume()
         try {
             mediaProjection?.stop()
         } catch (_: Exception) {
         }
         mediaProjection = null
         stopService(Intent(this, AudioCaptureService::class.java))
+    }
+
+    private fun getStreamVolume(): Int {
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        return audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+    }
+
+    private fun setStreamVolume(volume: Int) {
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        val max = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, volume.coerceIn(0, max), 0)
+    }
+
+    private fun restoreVolume() {
+        val v = savedVolume ?: return
+        savedVolume = null
+        try {
+            setStreamVolume(v)
+        } catch (e: Exception) {
+            Log.w("Aamina", "Volume restore failed", e)
+        }
+    }
+
+    /**
+     * EXPERIMENTAL "mute phone" helper: replays the captured PCM locally
+     * through a silent AudioTrack so the originating app keeps rendering
+     * audio (and capture keeps flowing) while the phone speaker stays
+     * quiet. Whether capture survives STREAM_MUSIC=0 is device-dependent:
+     * verify via logcat ("Aamina muteprobe ...").
+     */
+    private fun startSilentPlayer() {
+        stopSilentPlayer()
+        try {
+            val minOut = AudioTrack.getMinBufferSize(sampleRate, android.media.AudioFormat.CHANNEL_OUT_STEREO, android.media.AudioFormat.ENCODING_PCM_16BIT)
+            val track = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                .setAudioFormat(
+                    android.media.AudioFormat.Builder()
+                        .setEncoding(android.media.AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(android.media.AudioFormat.CHANNEL_OUT_STEREO)
+                        .build()
+                )
+                .setBufferSizeInBytes(minOut * 2)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+            track.setVolume(0f)
+            track.play()
+            silentPlayer = track
+        } catch (e: Exception) {
+            Log.w("Aamina", "Silent player start failed", e)
+            silentPlayer = null
+        }
+    }
+
+    private fun stopSilentPlayer() {
+        try {
+            silentPlayer?.stop()
+        } catch (_: Exception) {
+        }
+        try {
+            silentPlayer?.release()
+        } catch (_: Exception) {
+        }
+        silentPlayer = null
+    }
+
+    /**
+     * One-shot diagnostic: records the captured signal level for ~2.5s at
+     * full volume and ~2.5s at volume 0, then logs the verdict and puts
+     * the volume back the way mute mode wants it (0). Run automatically
+     * when mute mode starts. Watch with:
+     *   adb logcat -s Aamina
+     */
+    private fun runMuteVolumeProbe() {
+        thread(start = true) {
+            try {
+                val before = getStreamVolume()
+                setStreamVolume((getSystemService(Context.AUDIO_SERVICE) as AudioManager).getStreamMaxVolume(AudioManager.STREAM_MUSIC))
+                Thread.sleep(2500)
+                val loudLevel = lastCaptureAvg.get()
+                setStreamVolume(0)
+                Thread.sleep(2500)
+                val muteLevel = lastCaptureAvg.get()
+                // Leave it muted for the actual mute-mode session.
+                setStreamVolume(0)
+                val survives = muteLevel > 5.0 && muteLevel > loudLevel * 0.25
+                Log.i("Aamina", "muteprobe loud=$loudLevel mute=$muteLevel before=$before survives=$survives")
+            } catch (e: Exception) {
+                Log.w("Aamina", "mute probe failed", e)
+            }
+        }
     }
 
     private fun closeSocketQuietly() {

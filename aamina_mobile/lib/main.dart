@@ -86,39 +86,42 @@ class _AudioPageState extends State<AudioPage> {
               ? "Tap “Start now” on the Android screen-capture prompt…"
               : "Connecting to ${hostController.text.trim()}:5000…";
         });
-        await platform.invokeMethod("startCapture", {
-          "mode": mode,
-          "host": hostController.text.trim(),
-          "port": 5000,
-        });
-        // Mute the phone speaker (internal mode): AudioPlaybackCapture
-        // keeps flowing; the stream is played on the laptop, so plug your
-        // earphones into the LAPTOP.
+        // Mute the phone speaker (internal mode): the experimental
+        // silent player keeps the pipeline alive; your earphones must be
+        // plugged into the LAPTOP.
         if (mode == "internal" && mutePhone) {
-          try {
-            savedVolume = await platform.invokeMethod<int>("getVolume");
-            await platform.invokeMethod("setVolume", {"volume": 0});
-          } catch (_) {
-            savedVolume = null;
-          }
+          // Handled natively AFTER the screen-capture grant dialog —
+          // pass the flag through so timing is right.
+          await platform.invokeMethod("startCapture", {
+            "mode": mode,
+            "host": hostController.text.trim(),
+            "port": 5000,
+            "mutePhone": true,
+          });
+          savedVolume = -1; // native side owns save/restore now
+        } else {
+          await platform.invokeMethod("startCapture", {
+            "mode": mode,
+            "host": hostController.text.trim(),
+            "port": 5000,
+            "mutePhone": false,
+          });
         }
         setState(() {
           running = true;
           waitingForPermission = false;
           status = mode == "internal"
-              ? "Streaming internal audio — play something!"
+              ? (mutePhone
+                  ? "Streaming (phone muted — listen on your laptop 🎧)"
+                  : "Streaming internal audio — play something!")
               : mode == "mic"
                   ? "Streaming microphone — speak to test."
                   : "Streaming test tone (440 Hz).";
         });
       } else {
         await platform.invokeMethod("stopCapture");
-        if (savedVolume != null) {
-          try {
-            await platform.invokeMethod("setVolume", {"volume": savedVolume});
-          } catch (_) {}
-          savedVolume = null;
-        }
+        // Native side restores the phone volume itself; just clear the flag.
+        savedVolume = null;
         setState(() {
           running = false;
           waitingForPermission = false;
@@ -127,12 +130,8 @@ class _AudioPageState extends State<AudioPage> {
       }
     } on PlatformException catch (e) {
       if (!mounted) return;
-      if (savedVolume != null) {
-        try {
-          await platform.invokeMethod("setVolume", {"volume": savedVolume});
-        } catch (_) {}
-        savedVolume = null;
-      }
+      // Native side restores volume on stop/deny too.
+      savedVolume = null;
       setState(() {
         running = false;
         waitingForPermission = false;
@@ -154,7 +153,7 @@ class _AudioPageState extends State<AudioPage> {
 
       appBar: AppBar(
         title: const Text("Aamina"),
-      ),
+   analyse these pdf and give me possible questions coming for my collage exam   ),
 
       body: Center(
         child: Column(
