@@ -33,12 +33,11 @@ fn main() -> Result<()> {
     let device = if let Ok(substr) = env::var("AAMINA_OUTPUT_CONTAINS") {
         let mut found = None;
         for d in host.output_devices().context("Failed to list output devices")? {
-            if let Ok(name) = d.name() {
-                if name.to_lowercase().contains(&substr.to_lowercase()) {
+            if let Ok(name) = d.name()
+                && name.to_lowercase().contains(&substr.to_lowercase()) {
                     found = Some(d);
                     break;
                 }
-            }
         }
         found.context("No output device matched AAMINA_OUTPUT_CONTAINS")?
     } else {
