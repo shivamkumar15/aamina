@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'dart:async';
 
 void main() {
   runApp(const AaminaApp());
@@ -47,8 +48,15 @@ class _AudioPageState extends State<AudioPage> {
   /// while streaming and restored when streaming stops.
   bool mutePhone = false;
 
+  /// Live native state (connected / last error), polled while streaming.
+  /// Without this the button says "Streaming" even when the socket never
+  /// connected (e.g. adb reverse missing).
+  String connectionState = "";
+  Timer? _pollTimer;
+
   @override
   void dispose() {
+    _pollTimer?.cancel();
     hostController.dispose();
     super.dispose();
   }
@@ -111,20 +119,25 @@ class _AudioPageState extends State<AudioPage> {
                   ? "Streaming microphone — speak to test."
                   : "Streaming test tone (440 Hz).";
         });
+        _startPolling();
       } else {
         await platform.invokeMethod("stopCapture");
+        _stopPolling();
         if (!mounted) return;
         setState(() {
           running = false;
           waitingForPermission = false;
+          connectionState = "";
           status = "Stopped.";
         });
       }
     } on PlatformException catch (e) {
+      _stopPolling();
       if (!mounted) return;
       setState(() {
         running = false;
         waitingForPermission = false;
+        connectionState = "";
         status = e.code == "DENIED"
             ? "Screen-capture was denied — try again and tap “Start now”."
             : "Could not start: ${e.message ?? e.code}";
@@ -135,12 +148,45 @@ class _AudioPageState extends State<AudioPage> {
     } on MissingPluginException {
       // The aamina/audio channel only exists in the Android app; without this
       // the button would silently do nothing on desktop/web.
+      _stopPolling();
       if (!mounted) return;
       setState(() {
         running = false;
         waitingForPermission = false;
+        connectionState = "";
         status = "Streaming is only implemented on Android.";
       });
+    }
+  }
+
+  void _startPolling() {
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(const Duration(seconds: 1), (_) => _pollState());
+  }
+
+  void _stopPolling() {
+    _pollTimer?.cancel();
+    _pollTimer = null;
+  }
+
+  Future<void> _pollState() async {
+    if (!running) return;
+    try {
+      final state = await platform.invokeMapMethod<String, dynamic>("getState");
+      if (!mounted || !running) return;
+      final connected = state?["connected"] == true;
+      final lastError = state?["lastError"] as String?;
+      final host = state?["host"] ?? hostController.text.trim();
+      final port = state?["port"] ?? 5000;
+      setState(() {
+        connectionState = connected
+            ? "Connected to $host:$port — audio flowing."
+            : "Waiting for laptop at $host:$port…"
+                "${lastError != null ? "\n$lastError" : ""}"
+                "\nUSB: run `adb reverse tcp:$port tcp:$port`.";
+      });
+    } catch (_) {
+      // Poll is best-effort; the toggle() error paths own failure display.
     }
   }
 
@@ -229,6 +275,22 @@ class _AudioPageState extends State<AudioPage> {
                 style: const TextStyle(color: Colors.white70, fontSize: 13),
               ),
             ),
+            if (connectionState.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 32),
+                child: Text(
+                  connectionState,
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: connectionState.startsWith("Connected")
+                        ? Colors.greenAccent
+                        : Colors.amberAccent,
+                    fontSize: 12,
+                  ),
+                ),
+              ),
+            ],
           ],
         ),
       ),

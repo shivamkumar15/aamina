@@ -46,6 +46,19 @@ class MainActivity : FlutterActivity() {
     @Volatile private var targetHost = "127.0.0.1"
     private var targetPort = 5000
 
+    /// True once a TCP socket to the laptop is open. Surfaced to Dart via
+    /// "getState" so the UI can tell "waiting for laptop" apart from
+    /// "streaming". Without this the app says "Streaming" while
+    /// ensureOutputStream() retries silently (e.g. adb reverse missing).
+    @Volatile private var socketConnected = false
+
+    /// Last connection failure, for diagnostics via "getState"/logcat.
+    @Volatile private var lastConnectionError: String? = null
+
+    /// Bumped on every stop so a stale worker thread's `finally` block can't
+    /// clear `isCapturing` for a session started after it.
+    @Volatile private var pipelineGeneration = 0
+
     /// Silent local player used during "Mute phone" mode: an AudioTrack fed
     /// with zeroes at volume 0, so the internal-audio pipeline stays active
     /// while nothing comes out of the phone speaker.
@@ -114,6 +127,19 @@ class MainActivity : FlutterActivity() {
                     "stopCapture" -> {
                         stopCapture()
                         result.success(true)
+                    }
+                    "getState" -> {
+                        val socket = audioSocket
+                        val connected = socketConnected
+                            && socket != null && socket.isConnected && !socket.isClosed
+                        result.success(mapOf(
+                            "capturing" to isCapturing,
+                            "connected" to connected,
+                            "mode" to currentMode,
+                            "host" to targetHost,
+                            "port" to targetPort,
+                            "lastError" to lastConnectionError
+                        ))
                     }
                     "getVolume" -> {
                         result.success(getStreamVolume())
@@ -308,6 +334,7 @@ class MainActivity : FlutterActivity() {
 
     private fun spawnRecordThread(record: AudioRecord): Thread {
         val bufferSize = record.bufferSizeInFrames.coerceAtLeast(1) * record.channelCount * 2
+        val generation = pipelineGeneration
         return thread(start = true) {
             val buffer = ByteArray(bufferSize)
             var bytes = 0L
@@ -353,7 +380,10 @@ class MainActivity : FlutterActivity() {
                 }
             } finally {
                 closeSocketQuietly()
-                isCapturing = false
+                // A stale thread (from before a restart) must not kill the
+                // new session: only clear the flag if no stop happened after
+                // this thread was spawned.
+                if (generation == pipelineGeneration) isCapturing = false
             }
         }
     }
@@ -361,6 +391,7 @@ class MainActivity : FlutterActivity() {
     private fun startToneStream() {
         stopAudioPipelineOnly()
         isCapturing = true
+        val generation = pipelineGeneration
         toneThread = thread(start = true) {
             val frames = 1024
             val buffer = ByteArray(frames * 2 * 2)
@@ -402,18 +433,21 @@ class MainActivity : FlutterActivity() {
                 }
             } finally {
                 closeSocketQuietly()
-                isCapturing = false
+                if (generation == pipelineGeneration) isCapturing = false
             }
         }
     }
 
     private fun ensureOutputStream(): java.io.OutputStream? {
+        var attemptLogged = false
         while (isCapturing && !Thread.currentThread().isInterrupted) {
             val existing = audioSocket
             if (existing != null && existing.isConnected && !existing.isClosed) {
                 return try {
                     existing.getOutputStream()
-                } catch (_: IOException) {
+                } catch (e: IOException) {
+                    lastConnectionError = "output stream failed: ${e.message}"
+                    Log.w("Aamina", "Output stream failed, reconnecting", e)
                     closeSocketQuietly()
                     null
                 }
@@ -421,12 +455,23 @@ class MainActivity : FlutterActivity() {
 
             try {
                 val socket = Socket(targetHost, targetPort)
+                socket.tcpNoDelay = true
                 audioSocket = socket
+                socketConnected = true
+                lastConnectionError = null
                 Log.i("Aamina", "Connected to $targetHost:$targetPort")
                 return socket.getOutputStream()
-            } catch (_: IOException) {
+            } catch (e: IOException) {
+                socketConnected = false
+                lastConnectionError = "connect $targetHost:$targetPort failed: ${e.message}"
+                // Log once per burst, not every 250 ms, to keep logcat readable.
+                if (!attemptLogged) {
+                    Log.w("Aamina", "Connect $targetHost:$targetPort failed (${e.message}). " +
+                        "For USB run: adb reverse tcp:$targetPort tcp:$targetPort. Retrying...")
+                    attemptLogged = true
+                }
                 try {
-                    Thread.sleep(250)
+                    Thread.sleep(1000)
                 } catch (_: InterruptedException) {
                     Thread.currentThread().interrupt()
                     return null
@@ -438,20 +483,31 @@ class MainActivity : FlutterActivity() {
 
     private fun stopAudioPipelineOnly() {
         isCapturing = false
+        pipelineGeneration++
+        // Stop the AudioRecord FIRST: record.read(READ_BLOCKING) ignores
+        // Thread.interrupt(), so joining before stopping always times out and
+        // leaves a stale thread that can kill the next session.
+        try {
+            audioRecord?.stop()
+        } catch (_: Exception) {
+        }
         captureThread?.interrupt()
         toneThread?.interrupt()
-        captureThread?.join(200)
-        toneThread?.join(200)
+        silentPlayerThread?.interrupt()
+        try {
+            captureThread?.join(1000)
+        } catch (_: Exception) {
+        }
+        try {
+            toneThread?.join(1000)
+        } catch (_: Exception) {
+        }
         captureThread = null
         toneThread = null
 
         stopSilentPlayer()
         closeSocketQuietly()
 
-        try {
-            audioRecord?.stop()
-        } catch (_: Exception) {
-        }
         try {
             audioRecord?.release()
         } catch (_: Exception) {
@@ -559,6 +615,7 @@ class MainActivity : FlutterActivity() {
         } catch (_: Exception) {
         }
         audioSocket = null
+        socketConnected = false
     }
 
     override fun onDestroy() {
